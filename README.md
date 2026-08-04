@@ -77,3 +77,27 @@ POST /  (or /claude)   Authorization: Bearer <SHIM_TOKEN>
  -> {"ok": true, "result": "<model text>"}
 GET  /health  -> {"ok": true}
 ```
+
+## OpenAI-compatible endpoint (for n8n / LangChain)
+
+The shim also speaks the OpenAI Chat Completions protocol, so anything that
+takes a **Base URL** (n8n's *OpenAI Chat Model* node, LangChain's `ChatOpenAI`,
+…) can run on your subscription:
+
+| Setting  | Value                                       |
+| -------- | ------------------------------------------- |
+| Base URL | `https://<name>.up.railway.app/v1`          |
+| API Key  | your `SHIM_TOKEN`                           |
+| Model    | `sonnet` · `opus` · `haiku`                 |
+
+```
+POST /v1/chat/completions   {"model":..., "messages":[...], "tools":[...]}
+ -> standard chat.completion (with tool_calls when the model wants one)
+GET  /v1/models             -> model list
+```
+
+**Tool calling** works: the `tools` you send are the *caller's* functions (n8n
+executes them), so they are described to claude in the prompt and its JSON
+intent is re-shaped into OpenAI `tool_calls`. Claude's own tools stay disallowed
+on every path — nothing ever executes on the shim box. `stream: true` is
+answered with a single-chunk SSE stream.
