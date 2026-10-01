@@ -66,6 +66,7 @@ shim (your subscription) with no API fallback.
   secret; anyone with it can burn your quota.
 - **ToS:** a personal shim like this is fine under the subscription terms. Don't
   resell it or drive heavy multi-user load through one subscription.
+- **Tests:** `python3 -m unittest -v` (stdlib only, `claude` is mocked).
 - **Local run:** `SHIM_TOKEN=x CLAUDE_CODE_OAUTH_TOKEN=y python3 shim.py`
   (needs `claude` on PATH), then `curl localhost:8899/health`.
 
@@ -73,10 +74,39 @@ shim (your subscription) with no API fallback.
 
 ```
 POST /  (or /claude)   Authorization: Bearer <SHIM_TOKEN>
-    {"prompt": "...", "system": "...", "model": "opus"}
+    {"prompt": "...", "system": "...", "model": "opus",
+     "images": [{"media_type": "image/jpeg", "data": "<base64>"}]}   # images optional
  -> {"ok": true, "result": "<model text>"}
 GET  /health  -> {"ok": true}
 ```
+
+### Images (e.g. receipt photos)
+
+`images` is optional. Each item is `{"media_type": ..., "data": "<base64>"}`
+(raw base64, no `data:` prefix):
+
+- `media_type`: `image/jpeg` · `image/png` · `image/webp` · `image/gif`
+- at most **5** images, each at most **5 MB** after base64 decoding; the whole
+  base64 payload at most ~30 MB (Anthropic API request limit is 32 MB)
+- anything else → `400 {"ok": false, "error": "..."}`; a request body over 40 MB → `413`
+
+Without `images` the request runs exactly as before (`claude -p --output-format json`).
+With `images` the shim switches to
+`claude -p --input-format stream-json --output-format stream-json --verbose`,
+sends one user message with the image blocks followed by your `prompt` as the
+text block, and returns the final `result` event. Model, system prompt and the
+tool lockdown (all of Claude's tools, including `Read`, disallowed) are the same
+on both paths.
+
+```bash
+curl -s https://<name>.up.railway.app/claude \
+  -H "Authorization: Bearer $SHIM_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"prompt\":\"Extract merchant, date and total as JSON\",
+       \"images\":[{\"media_type\":\"image/jpeg\",\"data\":\"$(base64 < receipt.jpg | tr -d '\n')\"}]}"
+```
+
+Limits are tunable via env: `SHIM_MAX_IMAGES`, `SHIM_MAX_IMAGE_BYTES`,
+`SHIM_MAX_STDIN_BYTES`, `SHIM_MAX_BODY_BYTES`.
 
 ## OpenAI-compatible endpoint (for n8n / LangChain)
 
@@ -101,3 +131,9 @@ executes them), so they are described to claude in the prompt and its JSON
 intent is re-shaped into OpenAI `tool_calls`. Claude's own tools stay disallowed
 on every path — nothing ever executes on the shim box. `stream: true` is
 answered with a single-chunk SSE stream.
+
+**Images:** OpenAI `image_url` content parts are supported when the URL is a
+base64 `data:` URL (`{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`);
+they go through the same validation and stream-json path as `images` above.
+Remote `http(s)://` image URLs are rejected with `400` — the shim never fetches
+URLs.
