@@ -10,9 +10,10 @@ and paste here. No API key, no browser on the server, no ~/.claude files needed.
 
 Protocol (matches the bot's claude_cli client):
   POST /  (or /claude)   Authorization: Bearer <SHIM_TOKEN>
-      body: {"prompt": "...", "system": "...", "model": "opus"}
+      body: {"prompt": "...", "system": "...", "model": "opus",
+             "images": [{"media_type": "image/jpeg", "data": "<base64>"}]}  # images optional
       -> 200 {"ok": true, "result": "<model text>"}
-      -> 401/500/504 {"ok": false, "error": "..."}
+      -> 400/401/413/500/503/504 {"ok": false, "error": "..."}
   GET  /health           -> 200 {"ok": true}
 
 OpenAI-compatible surface (so an n8n "OpenAI Chat Model" node, or any LangChain
@@ -33,10 +34,13 @@ run anything on this box.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,6 +52,12 @@ PORT = int(os.environ.get("PORT") or os.environ.get("SHIM_PORT", "8899"))
 HOST = os.environ.get("SHIM_HOST", "0.0.0.0")
 TIMEOUT = int(os.environ.get("SHIM_TIMEOUT", "300"))
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "sonnet")
+# At most this many `claude` processes at once (each is a full Node CLI + an
+# upstream request on the subscription). Extra requests wait up to
+# SHIM_QUEUE_TIMEOUT seconds for a free slot, then get 503.
+MAX_CONCURRENCY = max(1, int(os.environ.get("SHIM_MAX_CONCURRENCY", "3")))
+QUEUE_TIMEOUT = float(os.environ.get("SHIM_QUEUE_TIMEOUT", "60"))
+_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENCY)
 # Lock claude down to pure text generation — no tools — so even a leaked token
 # can only burn subscription tokens, never execute anything on this machine.
 DISALLOWED = os.environ.get(
@@ -58,20 +68,140 @@ DISALLOWED = os.environ.get(
 )
 
 
-def run_claude(prompt: str, system: str = "", model: str = "") -> dict:
-    """Shell out to `claude -p`. Returns {"ok":bool, "result":str, "usage":dict}
-    or {"ok":False, "code":int, "error":str}."""
+# ------------------------------------------------------------------- images
+# Images (e.g. receipt photos) ride along as base64 content blocks. Plain text
+# requests keep the original `--output-format json` path byte-for-byte; only a
+# request WITH images switches to stream-json input/output.
+ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
+MAX_IMAGES = int(os.environ.get("SHIM_MAX_IMAGES", "10"))
+MAX_IMAGE_BYTES = int(os.environ.get("SHIM_MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
+# Total size of the stream-json line we pipe to claude. (The CLI's 10MB piped
+# stdin cap applies to text input, not stream-json — verified on 2.1.209 — but
+# the Anthropic API rejects requests over 32MB, so stay below that and fail
+# with a clear 400 instead of an opaque upstream error.)
+MAX_STDIN_BYTES = int(os.environ.get("SHIM_MAX_STDIN_BYTES", str(30_000_000)))
+# Request body cap (base64 inflates images by ~4/3, plus JSON overhead).
+MAX_BODY_BYTES = int(os.environ.get("SHIM_MAX_BODY_BYTES", str(40 * 1024 * 1024)))
+
+
+class ImageError(ValueError):
+    """Client-side problem with the supplied images -> HTTP 400."""
+
+
+def validate_images(raw) -> list:
+    """Normalise/validate `images` -> [{"media_type", "data"}]. Raises ImageError."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ImageError("images must be a list of {media_type, data}")
+    if len(raw) > MAX_IMAGES:
+        raise ImageError(f"too many images: {len(raw)} (max {MAX_IMAGES})")
+    out = []
+    for i, img in enumerate(raw):
+        if not isinstance(img, dict):
+            raise ImageError(f"images[{i}] must be an object {{media_type, data}}")
+        mt = (img.get("media_type") or "").strip().lower()
+        if mt == "image/jpg":
+            mt = "image/jpeg"
+        if mt not in ALLOWED_IMAGE_TYPES:
+            raise ImageError(
+                f"images[{i}].media_type {img.get('media_type')!r} not allowed "
+                f"(use one of {', '.join(ALLOWED_IMAGE_TYPES)})"
+            )
+        data = img.get("data")
+        if not isinstance(data, str) or not data.strip():
+            raise ImageError(f"images[{i}].data must be a non-empty base64 string")
+        data = "".join(data.split())  # drop whitespace/newlines from wrapped base64
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            raise ImageError(f"images[{i}].data is not valid base64") from None
+        if not decoded:
+            raise ImageError(f"images[{i}].data decodes to zero bytes")
+        if len(decoded) > MAX_IMAGE_BYTES:
+            raise ImageError(
+                f"images[{i}] is {len(decoded)} bytes after decoding "
+                f"(max {MAX_IMAGE_BYTES})"
+            )
+        out.append({"media_type": mt, "data": data})
+    return out
+
+
+def build_stream_input(prompt: str, images: list) -> str:
+    """One stream-json user message: image blocks first, then the text prompt."""
+    content = [
+        {
+            "type": "image",
+            "source": {"type": "base64", "media_type": img["media_type"], "data": img["data"]},
+        }
+        for img in images
+    ]
+    content.append({"type": "text", "text": prompt})
+    msg = {"type": "user", "message": {"role": "user", "content": content}}
+    return json.dumps(msg, ensure_ascii=False) + "\n"
+
+
+def parse_stream_output(stdout: str) -> dict:
+    """Pick the LAST `type == "result"` event out of stream-json stdout."""
+    final = None
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:  # noqa: BLE001 — ignore non-JSON noise
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "result":
+            final = ev
+    if final is None:
+        return {"ok": False, "code": 500, "error": "claude produced no result event"}
+    result = final.get("result")
+    if not isinstance(result, str):
+        result = "" if result is None else json.dumps(result, ensure_ascii=False)
+    if final.get("is_error"):
+        err = result or final.get("subtype") or "claude error"
+        return {"ok": False, "code": 500, "error": err[:800]}
+    return {"ok": True, "result": result, "usage": final.get("usage") or {}}
+
+
+def _base_args(model: str, system: str) -> list:
     args = [
-        CLAUDE, "-p",
-        "--output-format", "json",
         "--model", (model or DEFAULT_MODEL),
         # Non-interactive: never block on a permission/trust prompt.
         "--permission-mode", "bypassPermissions",
+        # Allow-list, not just deny-list: "" = NO built-in tools at all, so a
+        # tool added by a future CLI release can't slip past DISALLOWED.
+        "--tools", "",
+        # Ignore any MCP servers from the environment (~/.claude.json, .mcp.json,
+        # plugins) — no --mcp-config is passed, so zero MCP tools are loaded.
+        "--strict-mcp-config",
     ]
     if DISALLOWED:
         args += ["--disallowedTools", DISALLOWED]
     if system:
         args += ["--append-system-prompt", system]
+    return args
+
+
+def run_claude(prompt: str, system: str = "", model: str = "", images=None) -> dict:
+    """Shell out to `claude -p`. Returns {"ok":bool, "result":str, "usage":dict}
+    or {"ok":False, "code":int, "error":str}. `images` must already be
+    validated (see validate_images). Concurrency is capped by _SLOTS: when
+    all slots stay busy for QUEUE_TIMEOUT seconds -> 503."""
+    if not _SLOTS.acquire(timeout=QUEUE_TIMEOUT):
+        return {"ok": False, "code": 503,
+                "error": f"busy: {MAX_CONCURRENCY} claude calls already running, try again later"}
+    try:
+        if images:
+            return _run_claude_images(prompt, system, model, images)
+        return _run_claude_text(prompt, system, model)
+    finally:
+        _SLOTS.release()
+
+
+def _run_claude_text(prompt: str, system: str, model: str) -> dict:
+    args = [CLAUDE, "-p", "--output-format", "json"] + _base_args(model, system)
     try:
         proc = subprocess.run(
             args,
@@ -99,6 +229,43 @@ def run_claude(prompt: str, system: str = "", model: str = "") -> dict:
     return {"ok": True, "result": result, "usage": usage}
 
 
+def _run_claude_images(prompt: str, system: str, model: str, images: list) -> dict:
+    """Multimodal path: stream-json in (image + text blocks), stream-json out.
+    Same model / system / permission / disallowed-tools flags as the text path."""
+    stdin = build_stream_input(prompt, images)
+    if len(stdin.encode("utf-8")) > MAX_STDIN_BYTES:
+        return {
+            "ok": False, "code": 400,
+            "error": f"images too large in total (> {MAX_STDIN_BYTES} bytes of base64 payload)",
+        }
+    args = [
+        CLAUDE, "-p",
+        "--input-format", "stream-json",
+        "--output-format", "stream-json",
+        "--verbose",  # required by the CLI for stream-json output in -p mode
+    ] + _base_args(model, system)
+    try:
+        proc = subprocess.run(
+            args,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            cwd="/tmp",
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "code": 504, "error": "claude timeout"}
+    except FileNotFoundError:
+        return {"ok": False, "code": 500, "error": f"claude binary not found: {CLAUDE}"}
+    out = parse_stream_output(proc.stdout)
+    if proc.returncode != 0 and out.get("ok"):
+        # Non-zero exit but a "successful" result — don't trust it.
+        return {"ok": False, "code": 500, "error": (proc.stderr or "claude failed")[:800]}
+    if proc.returncode != 0 and out.get("error") == "claude produced no result event":
+        return {"ok": False, "code": 500, "error": (proc.stderr or "claude failed")[:800]}
+    return out
+
+
 # ---------------------------------------------------------------- OpenAI shim
 
 def pick_model(name: str) -> str:
@@ -123,6 +290,34 @@ def _text_of(content) -> str:
                 out.append(str(part))
         return "\n".join(p for p in out if p)
     return "" if content is None else str(content)
+
+
+_DATA_URL = re.compile(r"^data:([^;,]+)((?:;[^;,]*)*),(.*)$", re.S)
+
+
+def images_from_messages(messages: list) -> list:
+    """Collect OpenAI `image_url` content parts as raw {media_type, data} dicts
+    (validated later by validate_images). Only data: URLs are accepted — the
+    shim never fetches remote URLs. Raises ImageError."""
+    found = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            iu = part.get("image_url")
+            url = iu.get("url") if isinstance(iu, dict) else iu
+            if not isinstance(url, str) or not url.startswith("data:"):
+                raise ImageError("image_url must be a data: URL (data:image/...;base64,...); remote URLs are not supported")
+            mm = _DATA_URL.match(url)
+            if not mm or ";base64" not in mm.group(2).lower():
+                raise ImageError("image_url data: URL must be base64-encoded (data:image/png;base64,...)")
+            found.append({"media_type": mm.group(1), "data": mm.group(3)})
+    return found
 
 
 def messages_to_prompt(messages: list) -> tuple[str, str]:
@@ -285,6 +480,14 @@ def completion_to_sse(completion: dict) -> bytes:
     return out + b"data: [DONE]\n\n"
 
 
+class BodyTooLarge(ValueError):
+    pass
+
+
+class BadContentLength(ValueError):
+    pass
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -308,7 +511,15 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", "0") or "0")
+        raw = (self.headers.get("Content-Length", "0") or "0").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            raise BadContentLength(f"invalid Content-Length: {raw[:40]!r}") from None
+        if n < 0:
+            raise BadContentLength(f"invalid Content-Length: {n}")
+        if n > MAX_BODY_BYTES:
+            raise BodyTooLarge(f"request body too large: {n} bytes (max {MAX_BODY_BYTES})")
         return json.loads(self.rfile.read(n) or b"{}")
 
     def do_GET(self) -> None:  # noqa: N802
@@ -340,8 +551,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             data = self._body()
+        except BodyTooLarge as e:
+            self.close_connection = True
+            self._send(413, {"ok": False, "error": str(e)})
+            return
+        except BadContentLength as e:
+            self.close_connection = True  # body length unknown -> can't reuse the socket
+            self._send(400, {"ok": False, "error": str(e)})
+            return
         except Exception as e:  # noqa: BLE001
             self._send(400, {"ok": False, "error": f"bad json: {e}"})
+            return
+        if not isinstance(data, dict):
+            self._send(400, {"ok": False, "error": "body must be a JSON object"})
             return
 
         prompt = (data.get("prompt") or "").strip()
@@ -350,8 +572,13 @@ class Handler(BaseHTTPRequestHandler):
         if not prompt:
             self._send(400, {"ok": False, "error": "empty prompt"})
             return
+        try:
+            images = validate_images(data.get("images"))
+        except ImageError as e:
+            self._send(400, {"ok": False, "error": str(e)})
+            return
 
-        out = run_claude(prompt, system, model)
+        out = run_claude(prompt, system, model, images)
         if not out["ok"]:
             self._send(out["code"], {"ok": False, "error": out["error"]})
             return
@@ -362,8 +589,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             data = self._body()
+        except BodyTooLarge as e:
+            self.close_connection = True
+            self._send(413, {"error": {"message": str(e), "type": "invalid_request_error"}})
+            return
+        except BadContentLength as e:
+            self.close_connection = True
+            self._send(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+            return
         except Exception as e:  # noqa: BLE001
             self._send(400, {"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})
+            return
+        if not isinstance(data, dict):
+            self._send(400, {"error": {"message": "body must be a JSON object", "type": "invalid_request_error"}})
             return
 
         messages = data.get("messages") or []
@@ -373,6 +611,11 @@ class Handler(BaseHTTPRequestHandler):
         model_id = data.get("model") or DEFAULT_MODEL
         tools = [t for t in (data.get("tools") or []) if isinstance(t, dict)]
         system, prompt = messages_to_prompt(messages)
+        try:
+            images = validate_images(images_from_messages(messages) or None)
+        except ImageError as e:
+            self._send(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+            return
 
         if tools:
             specs = []
@@ -397,7 +640,7 @@ class Handler(BaseHTTPRequestHandler):
                 tools=json.dumps(specs, ensure_ascii=False, indent=2), choice=choice
             )).strip()
 
-        out = run_claude(prompt or " ", system, pick_model(model_id))
+        out = run_claude(prompt or " ", system, pick_model(model_id), images)
         if not out["ok"]:
             self._send(out["code"], {"error": {"message": out["error"], "type": "server_error"}})
             return
