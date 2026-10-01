@@ -86,7 +86,7 @@ GET  /health  -> {"ok": true}
 (raw base64, no `data:` prefix):
 
 - `media_type`: `image/jpeg` · `image/png` · `image/webp` · `image/gif`
-- at most **5** images, each at most **5 MB** after base64 decoding; the whole
+- at most **10** images, each at most **5 MB** after base64 decoding; the whole
   base64 payload at most ~30 MB (Anthropic API request limit is 32 MB)
 - anything else → `400 {"ok": false, "error": "..."}`; a request body over 40 MB → `413`
 

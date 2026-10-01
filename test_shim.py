@@ -54,6 +54,21 @@ class ValidateImagesTest(unittest.TestCase):
         with self.assertRaises(shim.ImageError):
             shim.validate_images([{"media_type": "image/png", "data": PNG}] * (shim.MAX_IMAGES + 1))
 
+    def test_default_limits(self):
+        # Defaults (when the env vars are unset): 10 images, ~30 MB total payload
+        # (Anthropic API rejects requests over 32 MB).
+        if "SHIM_MAX_IMAGES" not in os.environ:
+            self.assertEqual(shim.MAX_IMAGES, 10)
+        if "SHIM_MAX_STDIN_BYTES" not in os.environ:
+            self.assertEqual(shim.MAX_STDIN_BYTES, 30_000_000)
+
+    def test_ten_images_accepted_eleven_rejected(self):
+        with mock.patch.object(shim, "MAX_IMAGES", 10):
+            out = shim.validate_images([{"media_type": "image/png", "data": PNG}] * 10)
+            self.assertEqual(len(out), 10)
+            with self.assertRaises(shim.ImageError):
+                shim.validate_images([{"media_type": "image/png", "data": PNG}] * 11)
+
     def test_too_big(self):
         with mock.patch.object(shim, "MAX_IMAGE_BYTES", 4):
             with self.assertRaises(shim.ImageError):

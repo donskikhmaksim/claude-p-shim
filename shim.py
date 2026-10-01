@@ -73,7 +73,7 @@ DISALLOWED = os.environ.get(
 # requests keep the original `--output-format json` path byte-for-byte; only a
 # request WITH images switches to stream-json input/output.
 ALLOWED_IMAGE_TYPES = ("image/jpeg", "image/png", "image/webp", "image/gif")
-MAX_IMAGES = int(os.environ.get("SHIM_MAX_IMAGES", "5"))
+MAX_IMAGES = int(os.environ.get("SHIM_MAX_IMAGES", "10"))
 MAX_IMAGE_BYTES = int(os.environ.get("SHIM_MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
 # Total size of the stream-json line we pipe to claude. (The CLI's 10MB piped
 # stdin cap applies to text input, not stream-json — verified on 2.1.209 — but
