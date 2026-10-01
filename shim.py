@@ -170,6 +170,12 @@ def _base_args(model: str, system: str) -> list:
         "--model", (model or DEFAULT_MODEL),
         # Non-interactive: never block on a permission/trust prompt.
         "--permission-mode", "bypassPermissions",
+        # Allow-list, not just deny-list: "" = NO built-in tools at all, so a
+        # tool added by a future CLI release can't slip past DISALLOWED.
+        "--tools", "",
+        # Ignore any MCP servers from the environment (~/.claude.json, .mcp.json,
+        # plugins) — no --mcp-config is passed, so zero MCP tools are loaded.
+        "--strict-mcp-config",
     ]
     if DISALLOWED:
         args += ["--disallowedTools", DISALLOWED]

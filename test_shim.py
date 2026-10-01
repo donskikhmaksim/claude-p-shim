@@ -114,6 +114,8 @@ class RunClaudeTest(unittest.TestCase):
             shim.CLAUDE, "-p", "--output-format", "json",
             "--model", "opus",
             "--permission-mode", "bypassPermissions",
+            "--tools", "",
+            "--strict-mcp-config",
             "--disallowedTools", shim.DISALLOWED,
             "--append-system-prompt", "sys",
         ])
@@ -133,6 +135,8 @@ class RunClaudeTest(unittest.TestCase):
         self.assertEqual(args[args.index("--model") + 1], "haiku")
         # Tool lockdown must be identical to the text path (Read stays disallowed).
         self.assertEqual(args[args.index("--disallowedTools") + 1], shim.DISALLOWED)
+        self.assertEqual(args[args.index("--tools") + 1], "")
+        self.assertIn("--strict-mcp-config", args)
         self.assertIn("Read", shim.DISALLOWED.split(","))
         msg = json.loads(run.call_args.kwargs["input"])
         self.assertEqual(msg["message"]["content"][0]["source"]["data"], PNG)
