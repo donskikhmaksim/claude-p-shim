@@ -13,7 +13,7 @@ Protocol (matches the bot's claude_cli client):
       body: {"prompt": "...", "system": "...", "model": "opus",
              "images": [{"media_type": "image/jpeg", "data": "<base64>"}]}  # images optional
       -> 200 {"ok": true, "result": "<model text>"}
-      -> 401/500/504 {"ok": false, "error": "..."}
+      -> 400/401/413/500/503/504 {"ok": false, "error": "..."}
   GET  /health           -> 200 {"ok": true}
 
 OpenAI-compatible surface (so an n8n "OpenAI Chat Model" node, or any LangChain
@@ -40,6 +40,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +52,12 @@ PORT = int(os.environ.get("PORT") or os.environ.get("SHIM_PORT", "8899"))
 HOST = os.environ.get("SHIM_HOST", "0.0.0.0")
 TIMEOUT = int(os.environ.get("SHIM_TIMEOUT", "300"))
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "sonnet")
+# At most this many `claude` processes at once (each is a full Node CLI + an
+# upstream request on the subscription). Extra requests wait up to
+# SHIM_QUEUE_TIMEOUT seconds for a free slot, then get 503.
+MAX_CONCURRENCY = max(1, int(os.environ.get("SHIM_MAX_CONCURRENCY", "3")))
+QUEUE_TIMEOUT = float(os.environ.get("SHIM_QUEUE_TIMEOUT", "60"))
+_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENCY)
 # Lock claude down to pure text generation — no tools — so even a leaked token
 # can only burn subscription tokens, never execute anything on this machine.
 DISALLOWED = os.environ.get(
@@ -174,9 +181,20 @@ def _base_args(model: str, system: str) -> list:
 def run_claude(prompt: str, system: str = "", model: str = "", images=None) -> dict:
     """Shell out to `claude -p`. Returns {"ok":bool, "result":str, "usage":dict}
     or {"ok":False, "code":int, "error":str}. `images` must already be
-    validated (see validate_images)."""
-    if images:
-        return _run_claude_images(prompt, system, model, images)
+    validated (see validate_images). Concurrency is capped by _SLOTS: when
+    all slots stay busy for QUEUE_TIMEOUT seconds -> 503."""
+    if not _SLOTS.acquire(timeout=QUEUE_TIMEOUT):
+        return {"ok": False, "code": 503,
+                "error": f"busy: {MAX_CONCURRENCY} claude calls already running, try again later"}
+    try:
+        if images:
+            return _run_claude_images(prompt, system, model, images)
+        return _run_claude_text(prompt, system, model)
+    finally:
+        _SLOTS.release()
+
+
+def _run_claude_text(prompt: str, system: str, model: str) -> dict:
     args = [CLAUDE, "-p", "--output-format", "json"] + _base_args(model, system)
     try:
         proc = subprocess.run(
@@ -460,6 +478,10 @@ class BodyTooLarge(ValueError):
     pass
 
 
+class BadContentLength(ValueError):
+    pass
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -483,7 +505,13 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", "0") or "0")
+        raw = (self.headers.get("Content-Length", "0") or "0").strip()
+        try:
+            n = int(raw)
+        except ValueError:
+            raise BadContentLength(f"invalid Content-Length: {raw[:40]!r}") from None
+        if n < 0:
+            raise BadContentLength(f"invalid Content-Length: {n}")
         if n > MAX_BODY_BYTES:
             raise BodyTooLarge(f"request body too large: {n} bytes (max {MAX_BODY_BYTES})")
         return json.loads(self.rfile.read(n) or b"{}")
@@ -521,6 +549,10 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._send(413, {"ok": False, "error": str(e)})
             return
+        except BadContentLength as e:
+            self.close_connection = True  # body length unknown -> can't reuse the socket
+            self._send(400, {"ok": False, "error": str(e)})
+            return
         except Exception as e:  # noqa: BLE001
             self._send(400, {"ok": False, "error": f"bad json: {e}"})
             return
@@ -554,6 +586,10 @@ class Handler(BaseHTTPRequestHandler):
         except BodyTooLarge as e:
             self.close_connection = True
             self._send(413, {"error": {"message": str(e), "type": "invalid_request_error"}})
+            return
+        except BadContentLength as e:
+            self.close_connection = True
+            self._send(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
             return
         except Exception as e:  # noqa: BLE001
             self._send(400, {"error": {"message": f"bad json: {e}", "type": "invalid_request_error"}})

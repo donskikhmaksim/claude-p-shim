@@ -5,6 +5,7 @@ Run: python3 -m unittest -v
 import base64
 import json
 import os
+import socket
 import subprocess
 import threading
 import unittest
@@ -109,8 +110,13 @@ class RunClaudeTest(unittest.TestCase):
             out = shim.run_claude("p", "sys", "opus")
         self.assertEqual(out["result"], "hi")
         args = run.call_args.args[0]
-        self.assertEqual(args[:4], [shim.CLAUDE, "-p", "--output-format", "json"])
-        self.assertNotIn("--input-format", args)
+        self.assertEqual(args, [
+            shim.CLAUDE, "-p", "--output-format", "json",
+            "--model", "opus",
+            "--permission-mode", "bypassPermissions",
+            "--disallowedTools", shim.DISALLOWED,
+            "--append-system-prompt", "sys",
+        ])
         self.assertEqual(run.call_args.kwargs["input"], "p")
 
     def test_image_path_flags_and_stdin(self):
@@ -137,6 +143,30 @@ class RunClaudeTest(unittest.TestCase):
             out = shim.run_claude("p", images=imgs)
         self.assertEqual(out, {"ok": False, "code": 500, "error": "boom"})
 
+    def test_image_path_timeout_504(self):
+        imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
+        with mock.patch.object(shim.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1)):
+            out = shim.run_claude("p", images=imgs)
+        self.assertEqual(out, {"ok": False, "code": 504, "error": "claude timeout"})
+
+    def test_image_path_nonzero_exit_with_is_error_result(self):
+        imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
+        stdout = _stream({"type": "result", "subtype": "success", "is_error": True,
+                          "result": "Invalid API key"})
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=1, stderr="")):
+            out = shim.run_claude("p", images=imgs)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["code"], 500)
+        self.assertIn("Invalid API key", out["error"])
+
+    def test_image_path_nonzero_exit_with_success_result_not_trusted(self):
+        imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
+        stdout = _stream({"type": "result", "is_error": False, "result": "looks fine"})
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=2, stderr="crash")):
+            out = shim.run_claude("p", images=imgs)
+        self.assertEqual(out, {"ok": False, "code": 500, "error": "crash"})
+
     def test_image_path_total_cap(self):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
         with mock.patch.object(shim, "MAX_STDIN_BYTES", 10), \
@@ -144,6 +174,60 @@ class RunClaudeTest(unittest.TestCase):
             out = shim.run_claude("p", images=imgs)
         self.assertEqual(out["code"], 400)
         run.assert_not_called()
+
+
+class ConcurrencyTest(unittest.TestCase):
+    def test_busy_returns_503_without_spawning(self):
+        sem = threading.BoundedSemaphore(1)
+        sem.acquire()  # the only slot is taken
+        with mock.patch.object(shim, "_SLOTS", sem), \
+                mock.patch.object(shim, "QUEUE_TIMEOUT", 0.05), \
+                mock.patch.object(shim.subprocess, "run") as run:
+            out = shim.run_claude("p")
+        self.assertEqual(out["code"], 503)
+        self.assertFalse(out["ok"])
+        run.assert_not_called()
+
+    def test_slot_released_after_call_and_on_error(self):
+        sem = threading.BoundedSemaphore(1)
+        with mock.patch.object(shim, "_SLOTS", sem), \
+                mock.patch.object(shim, "QUEUE_TIMEOUT", 0.05):
+            with mock.patch.object(shim.subprocess, "run", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    shim.run_claude("p")
+            with mock.patch.object(shim.subprocess, "run",
+                                   return_value=_proc(json.dumps({"result": "ok"}))):
+                self.assertTrue(shim.run_claude("p")["ok"])
+                self.assertTrue(shim.run_claude("p")["ok"])
+
+    def test_caps_parallel_calls(self):
+        sem = threading.BoundedSemaphore(2)
+        lock = threading.Lock()
+        state = {"now": 0, "peak": 0}
+        gate = threading.Event()
+
+        def fake_run(*a, **kw):
+            with lock:
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            gate.wait(2)
+            with lock:
+                state["now"] -= 1
+            return _proc(json.dumps({"result": "ok"}))
+
+        results = []
+        with mock.patch.object(shim, "_SLOTS", sem), \
+                mock.patch.object(shim, "QUEUE_TIMEOUT", 5), \
+                mock.patch.object(shim.subprocess, "run", side_effect=fake_run):
+            ts = [threading.Thread(target=lambda: results.append(shim.run_claude("p"))) for _ in range(5)]
+            for t in ts:
+                t.start()
+            threading.Timer(0.2, gate.set).start()
+            for t in ts:
+                t.join(5)
+        self.assertEqual(state["peak"], 2)
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(r["ok"] for r in results))
 
 
 class OpenAIImagesTest(unittest.TestCase):
@@ -219,6 +303,57 @@ class HTTPTest(unittest.TestCase):
         with mock.patch.object(shim, "MAX_BODY_BYTES", 10):
             code, body = self.post("/claude", {"prompt": "this is longer than ten bytes"})
         self.assertEqual(code, 413)
+
+    def raw(self, request: bytes, timeout: float = 3.0):
+        """Send raw bytes, return (status_code, json_body). Times out instead of hanging."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as s:
+            s.sendall(request)
+            buf = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                head, sep, body = buf.partition(b"\r\n\r\n")
+                if sep:
+                    clen = [int(line.split(b":", 1)[1]) for line in head.split(b"\r\n")
+                            if line.lower().startswith(b"content-length:")]
+                    if clen and len(body) >= clen[0]:
+                        break
+        head, _, body = buf.partition(b"\r\n\r\n")
+        return int(head.split(b" ", 2)[1]), json.loads(body)
+
+    def _req(self, path, content_length, auth=True, body=b""):
+        lines = [f"POST {path} HTTP/1.1", "Host: x", "Content-Type: application/json",
+                 f"Content-Length: {content_length}"]
+        if auth:
+            lines.append("Authorization: Bearer test-token")
+        return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+
+    def test_negative_content_length_400(self):
+        for path in ("/claude", "/v1/chat/completions"):
+            with self.subTest(path=path), mock.patch.object(shim.subprocess, "run") as run:
+                code, body = self.raw(self._req(path, -1))
+                self.assertEqual(code, 400)
+                self.assertIn("Content-Length", json.dumps(body))
+                run.assert_not_called()
+
+    def test_non_numeric_content_length_400(self):
+        for path in ("/claude", "/v1/chat/completions"):
+            with self.subTest(path=path), mock.patch.object(shim.subprocess, "run") as run:
+                code, body = self.raw(self._req(path, "abc"))
+                self.assertEqual(code, 400)
+                self.assertIn("Content-Length", json.dumps(body))
+                run.assert_not_called()
+
+    def test_unauthorized_big_body_401_without_reading(self):
+        # Announce 100MB but send nothing: if the shim tried to read the body
+        # before checking the token, this would hang until the socket timeout.
+        for path in ("/claude", "/v1/chat/completions"):
+            with self.subTest(path=path), mock.patch.object(shim.subprocess, "run") as run:
+                code, _ = self.raw(self._req(path, 100 * 1024 * 1024, auth=False))
+                self.assertEqual(code, 401)
+                run.assert_not_called()
 
     def test_chat_completions_image_url(self):
         stdout = _stream({"type": "result", "is_error": False, "result": "42",

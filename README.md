@@ -108,6 +108,10 @@ curl -s https://<name>.up.railway.app/claude \
 Limits are tunable via env: `SHIM_MAX_IMAGES`, `SHIM_MAX_IMAGE_BYTES`,
 `SHIM_MAX_STDIN_BYTES`, `SHIM_MAX_BODY_BYTES`.
 
+Concurrency: at most `SHIM_MAX_CONCURRENCY` (default 3) `claude` processes run at
+once; extra requests wait up to `SHIM_QUEUE_TIMEOUT` seconds (default 60) for a
+free slot, then get `503`.
+
 ## OpenAI-compatible endpoint (for n8n / LangChain)
 
 The shim also speaks the OpenAI Chat Completions protocol, so anything that
