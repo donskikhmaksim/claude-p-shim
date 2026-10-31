@@ -403,3 +403,18 @@ class HTTPTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TokenTests(unittest.TestCase):
+    def test_main_and_extra_tokens(self):
+        with mock.patch.object(shim, "TOKEN", "main"), mock.patch.object(shim, "EXTRA_TOKENS", ["a", "b"]):
+            self.assertTrue(shim.token_ok("Bearer main"))
+            self.assertTrue(shim.token_ok("Bearer b"))
+            self.assertFalse(shim.token_ok("Bearer c"))
+            self.assertFalse(shim.token_ok("main"))
+            self.assertFalse(shim.token_ok(""))
+
+    def test_nothing_passes_without_main_token(self):
+        with mock.patch.object(shim, "TOKEN", ""), mock.patch.object(shim, "EXTRA_TOKENS", ["a"]):
+            self.assertFalse(shim.token_ok("Bearer a"))
+            self.assertFalse(shim.token_ok("Bearer "))

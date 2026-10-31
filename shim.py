@@ -37,6 +37,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import hmac
 import os
 import re
 import subprocess
@@ -46,6 +47,9 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN = os.environ.get("SHIM_TOKEN", "")
+# Extra client tokens (comma-separated), so each consumer can get its own key and one can be
+# rotated without touching the others. SHIM_TOKEN stays the main one and is still required.
+EXTRA_TOKENS = [t.strip() for t in os.environ.get("SHIM_EXTRA_TOKENS", "").split(",") if t.strip()]
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 # Railway injects PORT; fall back to SHIM_PORT for local runs.
 PORT = int(os.environ.get("PORT") or os.environ.get("SHIM_PORT", "8899"))
@@ -82,6 +86,14 @@ MAX_IMAGE_BYTES = int(os.environ.get("SHIM_MAX_IMAGE_BYTES", str(5 * 1024 * 1024
 MAX_STDIN_BYTES = int(os.environ.get("SHIM_MAX_STDIN_BYTES", str(30_000_000)))
 # Request body cap (base64 inflates images by ~4/3, plus JSON overhead).
 MAX_BODY_BYTES = int(os.environ.get("SHIM_MAX_BODY_BYTES", str(40 * 1024 * 1024)))
+
+
+def token_ok(header: str) -> bool:
+    """Bearer SHIM_TOKEN or one of SHIM_EXTRA_TOKENS; nothing passes when SHIM_TOKEN is unset."""
+    if not TOKEN or not header.startswith("Bearer "):
+        return False
+    given = header[len("Bearer "):].encode()
+    return any(hmac.compare_digest(given, t.encode()) for t in [TOKEN, *EXTRA_TOKENS])
 
 
 class ImageError(ValueError):
@@ -505,7 +517,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authed(self) -> bool:
-        if not TOKEN or self.headers.get("Authorization", "") != f"Bearer {TOKEN}":
+        if not token_ok(self.headers.get("Authorization", "")):
             self._send(401, {"error": {"message": "unauthorized", "type": "invalid_request_error"}})
             return False
         return True
@@ -546,7 +558,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("", "/claude"):
             self._send(404, {"ok": False, "error": "not found"})
             return
-        if not TOKEN or self.headers.get("Authorization", "") != f"Bearer {TOKEN}":
+        if not token_ok(self.headers.get("Authorization", "")):
             self._send(401, {"ok": False, "error": "unauthorized"})
             return
         try:
