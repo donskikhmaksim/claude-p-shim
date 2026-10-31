@@ -37,6 +37,7 @@ this repo. Then in the service **Variables**, set:
 | ------------------------- | -------------------------------------------------------- |
 | `CLAUDE_CODE_OAUTH_TOKEN` | the token from step 1                                    |
 | `SHIM_TOKEN`              | any long random string you invent (keep it secret)       |
+| `SHIM_EXTRA_TOKENS`       | optional: more client tokens, comma-separated (one per consumer, so each can be rotated alone) |
 | `CLAUDE_MODEL`            | `sonnet` (default) · `haiku` (cheapest) · `opus` (best)  |
 
 Railway builds the Dockerfile and gives the service a public URL like
