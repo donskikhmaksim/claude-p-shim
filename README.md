@@ -71,6 +71,22 @@ shim (your subscription) with no API fallback.
 - **Local run:** `SHIM_TOKEN=x CLAUDE_CODE_OAUTH_TOKEN=y python3 shim.py`
   (needs `claude` on PATH), then `curl localhost:8899/health`.
 
+## Two logins (primary + backup)
+
+Set `CLAUDE_OAUTH_TOKEN_PRIMARY` (and optionally `CLAUDE_OAUTH_TOKEN_BACKUP`; if empty, the old `CLAUDE_CODE_OAUTH_TOKEN`
+is the backup). Every call goes through the primary; a login failure (expired / revoked token, `/login`) or a usage limit
+retries the same call once through the backup, and the primary rests `SHIM_FAILOVER_COOLDOWN` seconds (default 600) before it
+is tried again. Other errors (timeouts, bad prompts) are not retried. Each call writes one log line
+`{"ev":"call","profile":"primary|backup","ok":…,"ms":…}` and the response carries `"profile"`.
+
+- `GET /status` (Bearer SHIM_TOKEN) — active profile, last good / failed call, consecutive failures, a short error (no
+  secrets), issued / expires dates (`CLAUDE_OAUTH_*_ISSUED_AT` + 365 days).
+- `POST /check` (Bearer SHIM_TOKEN) — one tiny haiku call per configured profile, no failover; returns the status. Your app
+  can call it every few hours and alert when a login is dead or close to expiry.
+
+A `setup-token` token does **not** refresh itself by being used; it lives ~1 year. To renew: run `claude setup-token` again
+and replace the variable (and its `ISSUED_AT`).
+
 ## Protocol
 
 ```

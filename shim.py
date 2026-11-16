@@ -96,6 +96,106 @@ def token_ok(header: str) -> bool:
     return any(hmac.compare_digest(given, t.encode()) for t in [TOKEN, *EXTRA_TOKENS])
 
 
+# ------------------------------------------------------------------ profiles
+# Two Claude subscription logins (owner 16.11): a PRIMARY and a BACKUP. Each call goes through the primary; if it fails because
+# of the login (expired / revoked token) or a usage limit, the same call is retried once through the backup, and the primary
+# rests for SHIM_FAILOVER_COOLDOWN seconds before it is tried again ("comes back when it is alive"). Every call logs which
+# profile ran it. Backward compatible: the old CLAUDE_CODE_OAUTH_TOKEN is the BACKUP when no backup is set, so today's login
+# becomes the reserve as soon as a new primary is added.
+#   CLAUDE_OAUTH_TOKEN_PRIMARY / CLAUDE_OAUTH_TOKEN_BACKUP   — tokens from `claude setup-token` (~1 year, no auto-refresh)
+#   CLAUDE_OAUTH_PRIMARY_ISSUED_AT / CLAUDE_OAUTH_BACKUP_ISSUED_AT — YYYY-MM-DD the token was made (for "expires on")
+TOKEN_LIFETIME_DAYS = int(os.environ.get("SHIM_TOKEN_LIFETIME_DAYS", "365"))
+FAILOVER_COOLDOWN = float(os.environ.get("SHIM_FAILOVER_COOLDOWN", "600"))
+_ACCOUNT_ERROR = re.compile(
+    r"401|403|429|unauthori[sz]ed|authenticat|oauth|invalid (api )?key|token (has )?expired|expired token|revoked|"
+    r"/login|log in|usage limit|rate.?limit|limit reached|quota|credit balance",
+    re.I,
+)
+_SECRETISH = re.compile(r"sk-ant-[A-Za-z0-9_\-]+|[A-Za-z0-9_\-]{40,}")
+
+
+def _profiles() -> list:
+    primary = os.environ.get("CLAUDE_OAUTH_TOKEN_PRIMARY", "").strip()
+    backup = (os.environ.get("CLAUDE_OAUTH_TOKEN_BACKUP") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    return [
+        {"name": "primary", "token": primary, "issued": os.environ.get("CLAUDE_OAUTH_PRIMARY_ISSUED_AT", "").strip()},
+        {"name": "backup", "token": backup, "issued": os.environ.get("CLAUDE_OAUTH_BACKUP_ISSUED_AT", "").strip()},
+    ]
+
+
+_STATE_LOCK = threading.Lock()
+_STATE: dict = {n: {"last_ok": None, "last_fail": None, "last_error": None, "fails": 0, "down_until": 0.0} for n in ("primary", "backup")}
+
+
+def is_account_error(err: str) -> bool:
+    """The login or the subscription limit failed (worth trying the other profile), not the request itself."""
+    return bool(_ACCOUNT_ERROR.search(err or ""))
+
+
+def _redact(err: str) -> str:
+    return _SECRETISH.sub("<redacted>", (err or "").replace("\n", " "))[:200]
+
+
+def _mark(name: str, ok: bool, err: str = "", cooldown: bool = False) -> None:
+    now = time.time()
+    with _STATE_LOCK:
+        st = _STATE[name]
+        if ok:
+            st.update(last_ok=now, fails=0, down_until=0.0)
+        else:
+            st.update(last_fail=now, last_error=_redact(err), fails=st["fails"] + 1)
+            if cooldown:
+                st["down_until"] = now + FAILOVER_COOLDOWN
+
+
+def call_order() -> list:
+    """Configured profiles, primary first unless it is resting after a login / limit failure."""
+    ps = [p for p in _profiles() if p["token"]]
+    now = time.time()
+    with _STATE_LOCK:
+        resting = {n for n, st in _STATE.items() if st["down_until"] > now}
+    return sorted(ps, key=lambda p: (p["name"] in resting, p["name"] != "primary"))
+
+
+def _iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else None
+
+
+def _expires(issued: str):
+    try:
+        t = time.mktime(time.strptime(issued, "%Y-%m-%d")) + TOKEN_LIFETIME_DAYS * 86400
+        return time.strftime("%Y-%m-%d", time.gmtime(t))
+    except (ValueError, TypeError):
+        return None
+
+
+def status() -> dict:
+    order = call_order()
+    with _STATE_LOCK:
+        snap = {n: dict(st) for n, st in _STATE.items()}
+    return {
+        "active": order[0]["name"] if order else None,
+        "profiles": [
+            {
+                "name": p["name"],
+                "configured": bool(p["token"]),
+                "lastOkAt": _iso(snap[p["name"]]["last_ok"]),
+                "lastFailAt": _iso(snap[p["name"]]["last_fail"]),
+                "lastError": snap[p["name"]]["last_error"],
+                "consecutiveFails": snap[p["name"]]["fails"],
+                "restingUntil": _iso(snap[p["name"]]["down_until"]) if snap[p["name"]]["down_until"] > time.time() else None,
+                "issuedAt": p["issued"] or None,
+                "expiresAt": _expires(p["issued"]),
+            }
+            for p in _profiles()
+        ],
+    }
+
+
+def _log_call(kind: str, profile, ok: bool, ms: int, code=None) -> None:
+    print(json.dumps({"ev": "call", "kind": kind, "profile": profile, "ok": ok, "ms": ms, "code": code}), flush=True)
+
+
 class ImageError(ValueError):
     """Client-side problem with the supplied images -> HTTP 400."""
 
@@ -196,23 +296,44 @@ def _base_args(model: str, system: str) -> list:
     return args
 
 
-def run_claude(prompt: str, system: str = "", model: str = "", images=None) -> dict:
-    """Shell out to `claude -p`. Returns {"ok":bool, "result":str, "usage":dict}
-    or {"ok":False, "code":int, "error":str}. `images` must already be
+def run_claude(prompt: str, system: str = "", model: str = "", images=None, only=None) -> dict:
+    """Shell out to `claude -p`. Returns {"ok":bool, "result":str, "usage":dict, "profile":str}
+    or {"ok":False, "code":int, "error":str, "profile":str|None}. `images` must already be
     validated (see validate_images). Concurrency is capped by _SLOTS: when
-    all slots stay busy for QUEUE_TIMEOUT seconds -> 503."""
+    all slots stay busy for QUEUE_TIMEOUT seconds -> 503. Goes through the primary
+    profile; a login / limit failure is retried once through the backup. `only` = one
+    profile name, no failover (health checks)."""
     if not _SLOTS.acquire(timeout=QUEUE_TIMEOUT):
         return {"ok": False, "code": 503,
-                "error": f"busy: {MAX_CONCURRENCY} claude calls already running, try again later"}
+                "error": f"busy: {MAX_CONCURRENCY} claude calls already running, try again later", "profile": None}
     try:
-        if images:
-            return _run_claude_images(prompt, system, model, images)
-        return _run_claude_text(prompt, system, model)
+        order = [p for p in call_order() if not only or p["name"] == only]
+        if not order:
+            # No token at all: run as before (the CLI reports the missing login).
+            order = [{"name": None, "token": ""}]
+        out: dict = {}
+        for i, p in enumerate(order):
+            env = {**os.environ, "CLAUDE_CODE_OAUTH_TOKEN": p["token"]} if p["token"] else None
+            t0 = time.time()
+            out = _run_claude_images(prompt, system, model, images, env) if images else _run_claude_text(prompt, system, model, env)
+            out["profile"] = p["name"]
+            _log_call("images" if images else "text", p["name"], out["ok"], int((time.time() - t0) * 1000), out.get("code"))
+            if p["name"] is None:
+                return out
+            if out["ok"]:
+                _mark(p["name"], True)
+                return out
+            account = is_account_error(out.get("error", ""))
+            _mark(p["name"], False, out.get("error", ""), cooldown=account)
+            # Not the login / limit (bad prompt, timeout): the other profile would fail the same way.
+            if not account or i == len(order) - 1:
+                return out
+        return out
     finally:
         _SLOTS.release()
 
 
-def _run_claude_text(prompt: str, system: str, model: str) -> dict:
+def _run_claude_text(prompt: str, system: str, model: str, env=None) -> dict:
     args = [CLAUDE, "-p", "--output-format", "json"] + _base_args(model, system)
     try:
         proc = subprocess.run(
@@ -222,6 +343,7 @@ def _run_claude_text(prompt: str, system: str, model: str) -> dict:
             text=True,
             timeout=TIMEOUT,
             cwd="/tmp",
+            **({"env": env} if env else {}),
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "code": 504, "error": "claude timeout"}
@@ -241,7 +363,7 @@ def _run_claude_text(prompt: str, system: str, model: str) -> dict:
     return {"ok": True, "result": result, "usage": usage}
 
 
-def _run_claude_images(prompt: str, system: str, model: str, images: list) -> dict:
+def _run_claude_images(prompt: str, system: str, model: str, images: list, env=None) -> dict:
     """Multimodal path: stream-json in (image + text blocks), stream-json out.
     Same model / system / permission / disallowed-tools flags as the text path."""
     stdin = build_stream_input(prompt, images)
@@ -264,6 +386,7 @@ def _run_claude_images(prompt: str, system: str, model: str, images: list) -> di
             text=True,
             timeout=TIMEOUT,
             cwd="/tmp",
+            **({"env": env} if env else {}),
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "code": 504, "error": "claude timeout"}
@@ -538,6 +661,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path in ("/health", "/claude/health", ""):
             self._send(200, {"ok": True})
+        elif path in ("/status", "/claude/status"):
+            # Which login is active, last good / failed call, expiry (no tokens, no secrets). Same client token as calls.
+            if not token_ok(self.headers.get("Authorization", "")):
+                self._send(401, {"ok": False, "error": "unauthorized"})
+                return
+            self._send(200, {"ok": True, **status()})
         elif path in ("/v1/models", "/models"):
             now = int(time.time())
             self._send(200, {
@@ -554,6 +683,15 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path in ("/v1/chat/completions", "/chat/completions"):
             self.handle_chat_completions()
+            return
+        if path in ("/check", "/claude/check"):
+            # Health check of each login: one tiny call per configured profile (no failover), then the status.
+            if not token_ok(self.headers.get("Authorization", "")):
+                self._send(401, {"ok": False, "error": "unauthorized"})
+                return
+            for p in [p for p in _profiles() if p["token"]]:
+                run_claude("Reply with the single word OK.", "", "haiku", None, only=p["name"])
+            self._send(200, {"ok": True, **status()})
             return
         if path not in ("", "/claude"):
             self._send(404, {"ok": False, "error": "not found"})
@@ -592,9 +730,9 @@ class Handler(BaseHTTPRequestHandler):
 
         out = run_claude(prompt, system, model, images)
         if not out["ok"]:
-            self._send(out["code"], {"ok": False, "error": out["error"]})
+            self._send(out["code"], {"ok": False, "error": out["error"], "profile": out.get("profile")})
             return
-        self._send(200, {"ok": True, "result": out["result"]})
+        self._send(200, {"ok": True, "result": out["result"], "profile": out.get("profile")})
 
     def handle_chat_completions(self) -> None:
         if not self._authed():

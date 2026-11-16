@@ -141,7 +141,7 @@ class RunClaudeTest(unittest.TestCase):
         stdout = _stream({"type": "result", "is_error": False, "result": "receipt total 9.99"})
         with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout)) as run:
             out = shim.run_claude("read receipt", "be terse", "haiku", imgs)
-        self.assertEqual(out, {"ok": True, "result": "receipt total 9.99", "usage": {}})
+        self.assertEqual(out, {"ok": True, "result": "receipt total 9.99", "usage": {}, "profile": None})
         args = run.call_args.args[0]
         for flag in ("--verbose", "--permission-mode", "--disallowedTools", "--append-system-prompt"):
             self.assertIn(flag, args)
@@ -160,14 +160,14 @@ class RunClaudeTest(unittest.TestCase):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
         with mock.patch.object(shim.subprocess, "run", return_value=_proc("", rc=1, stderr="boom")):
             out = shim.run_claude("p", images=imgs)
-        self.assertEqual(out, {"ok": False, "code": 500, "error": "boom"})
+        self.assertEqual(out, {"ok": False, "code": 500, "error": "boom", "profile": None})
 
     def test_image_path_timeout_504(self):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
         with mock.patch.object(shim.subprocess, "run",
                                side_effect=subprocess.TimeoutExpired(cmd="claude", timeout=1)):
             out = shim.run_claude("p", images=imgs)
-        self.assertEqual(out, {"ok": False, "code": 504, "error": "claude timeout"})
+        self.assertEqual(out, {"ok": False, "code": 504, "error": "claude timeout", "profile": None})
 
     def test_image_path_nonzero_exit_with_is_error_result(self):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
@@ -184,7 +184,7 @@ class RunClaudeTest(unittest.TestCase):
         stdout = _stream({"type": "result", "is_error": False, "result": "looks fine"})
         with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=2, stderr="crash")):
             out = shim.run_claude("p", images=imgs)
-        self.assertEqual(out, {"ok": False, "code": 500, "error": "crash"})
+        self.assertEqual(out, {"ok": False, "code": 500, "error": "crash", "profile": None})
 
     def test_image_path_total_cap(self):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
@@ -299,14 +299,14 @@ class HTTPTest(unittest.TestCase):
             code, body = self.post("/claude", {
                 "prompt": "total?", "images": [{"media_type": "image/jpeg", "data": JPG}],
             })
-        self.assertEqual((code, body), (200, {"ok": True, "result": "ok!"}))
+        self.assertEqual((code, body), (200, {"ok": True, "result": "ok!", "profile": None}))
         self.assertIn("stream-json", run.call_args.args[0])
 
     def test_claude_without_images_uses_json_path(self):
         with mock.patch.object(shim.subprocess, "run",
                                return_value=_proc(json.dumps({"result": "plain"}))) as run:
             code, body = self.post("/claude", {"prompt": "hi"})
-        self.assertEqual((code, body), (200, {"ok": True, "result": "plain"}))
+        self.assertEqual((code, body), (200, {"ok": True, "result": "plain", "profile": None}))
         self.assertNotIn("stream-json", run.call_args.args[0])
 
     def test_claude_bad_image_400(self):
@@ -418,3 +418,100 @@ class TokenTests(unittest.TestCase):
         with mock.patch.object(shim, "TOKEN", ""), mock.patch.object(shim, "EXTRA_TOKENS", ["a"]):
             self.assertFalse(shim.token_ok("Bearer a"))
             self.assertFalse(shim.token_ok("Bearer "))
+
+
+class ProfilesTest(unittest.TestCase):
+    """Two logins (owner 16.11): primary first, a login / limit failure → the backup, the primary rests, then comes back."""
+
+    def setUp(self):
+        for n in shim._STATE:
+            shim._STATE[n].update(last_ok=None, last_fail=None, last_error=None, fails=0, down_until=0.0)
+        self.env = mock.patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_PRIMARY": "tok-primary", "CLAUDE_OAUTH_TOKEN_BACKUP": "tok-backup", "CLAUDE_OAUTH_PRIMARY_ISSUED_AT": "2026-11-16"}, clear=False)
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+
+    def _calls_tokens(self, run):
+        return [c.kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"] for c in run.call_args_list]
+
+    def test_primary_first(self):
+        ok = _proc(json.dumps({"result": "fine"}))
+        with mock.patch.object(shim.subprocess, "run", return_value=ok) as run:
+            out = shim.run_claude("hi")
+        self.assertEqual((out["ok"], out["profile"]), (True, "primary"))
+        self.assertEqual(self._calls_tokens(run), ["tok-primary"])
+
+    def test_login_failure_falls_over_to_backup_and_primary_rests(self):
+        bad = _proc("", rc=1, stderr="Invalid API key · Please run /login")
+        ok = _proc(json.dumps({"result": "fine"}))
+        with mock.patch.object(shim.subprocess, "run", side_effect=[bad, ok]) as run:
+            out = shim.run_claude("hi")
+        self.assertEqual((out["ok"], out["profile"]), (True, "backup"))
+        self.assertEqual(self._calls_tokens(run), ["tok-primary", "tok-backup"])
+        # The primary rests: the next call goes straight to the backup.
+        with mock.patch.object(shim.subprocess, "run", return_value=ok) as run:
+            self.assertEqual(shim.run_claude("again")["profile"], "backup")
+        self.assertEqual(self._calls_tokens(run), ["tok-backup"])
+        # After the cooldown the primary is tried first again.
+        shim._STATE["primary"]["down_until"] = 0.0
+        with mock.patch.object(shim.subprocess, "run", return_value=ok):
+            self.assertEqual(shim.run_claude("later")["profile"], "primary")
+
+    def test_usage_limit_also_falls_over(self):
+        lim = _proc("", rc=1, stderr="Claude AI usage limit reached|1763337600")
+        ok = _proc(json.dumps({"result": "fine"}))
+        with mock.patch.object(shim.subprocess, "run", side_effect=[lim, ok]):
+            self.assertEqual(shim.run_claude("hi")["profile"], "backup")
+
+    def test_other_errors_do_not_fall_over(self):
+        boom = _proc("", rc=1, stderr="model overloaded, try later")
+        with mock.patch.object(shim.subprocess, "run", return_value=boom) as run:
+            out = shim.run_claude("hi")
+        self.assertEqual((out["ok"], out["profile"]), (False, "primary"))
+        self.assertEqual(run.call_count, 1)
+
+    def test_old_variable_is_the_backup(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_PRIMARY": "", "CLAUDE_OAUTH_TOKEN_BACKUP": "", "CLAUDE_CODE_OAUTH_TOKEN": "tok-old"}):
+            ok = _proc(json.dumps({"result": "fine"}))
+            with mock.patch.object(shim.subprocess, "run", return_value=ok) as run:
+                self.assertEqual(shim.run_claude("hi")["profile"], "backup")
+            self.assertEqual(self._calls_tokens(run), ["tok-old"])
+            st = shim.status()
+            self.assertEqual(st["active"], "backup")
+            self.assertEqual([p["configured"] for p in st["profiles"]], [False, True])
+
+    def test_status_has_no_secrets_and_knows_expiry(self):
+        bad = _proc("", rc=1, stderr="OAuth token has expired: sk-ant-oat01-SECRETSECRETSECRET")
+        ok = _proc(json.dumps({"result": "fine"}))
+        with mock.patch.object(shim.subprocess, "run", side_effect=[bad, ok]):
+            shim.run_claude("hi")
+        st = shim.status()
+        prim = st["profiles"][0]
+        self.assertEqual((prim["name"], prim["consecutiveFails"], prim["expiresAt"]), ("primary", 1, "2027-11-16"))
+        self.assertNotIn("SECRET", json.dumps(st))
+        self.assertNotIn("tok-", json.dumps(st))
+
+
+class StatusHTTPTest(HTTPTest):
+    def get(self, path, auth=True):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", headers={"Authorization": "Bearer test-token"} if auth else {})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_status_needs_the_client_token(self):
+        self.assertEqual(self.get("/status", auth=False)[0], 401)
+        code, body = self.get("/status")
+        self.assertEqual(code, 200)
+        self.assertIn("profiles", body)
+
+    def test_check_calls_each_configured_profile_once_without_failover(self):
+        ok = _proc(json.dumps({"result": "OK"}))
+        with mock.patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_PRIMARY": "tok-p", "CLAUDE_OAUTH_TOKEN_BACKUP": "tok-b"}), mock.patch.object(shim.subprocess, "run", return_value=ok) as run:
+            code, body = self.post("/check", {})
+        self.assertEqual(code, 200)
+        self.assertEqual([c.kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN"] for c in run.call_args_list], ["tok-p", "tok-b"])
+        self.assertTrue(all(p["lastOkAt"] for p in body["profiles"]))
