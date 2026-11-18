@@ -160,7 +160,7 @@ class RunClaudeTest(unittest.TestCase):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
         with mock.patch.object(shim.subprocess, "run", return_value=_proc("", rc=1, stderr="boom")):
             out = shim.run_claude("p", images=imgs)
-        self.assertEqual(out, {"ok": False, "code": 500, "error": "boom"})
+        self.assertEqual(out, {"ok": False, "code": 500, "error": "boom", "error_code": "other"})
 
     def test_image_path_timeout_504(self):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
@@ -184,7 +184,7 @@ class RunClaudeTest(unittest.TestCase):
         stdout = _stream({"type": "result", "is_error": False, "result": "looks fine"})
         with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=2, stderr="crash")):
             out = shim.run_claude("p", images=imgs)
-        self.assertEqual(out, {"ok": False, "code": 500, "error": "crash"})
+        self.assertEqual(out, {"ok": False, "code": 500, "error": "crash", "error_code": "other"})
 
     def test_image_path_total_cap(self):
         imgs = shim.validate_images([{"media_type": "image/png", "data": PNG}])
@@ -403,6 +403,66 @@ class HTTPTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FailureReasonTest(unittest.TestCase):
+    def test_classify(self):
+        c = shim.classify_failure
+        self.assertEqual(c("Invalid API key · Please run /login"), "auth_expired")
+        self.assertEqual(c("OAuth token has expired"), "auth_expired")
+        self.assertEqual(c("Claude AI usage limit reached|1731"), "rate_limited")
+        self.assertEqual(c("429 rate_limit_error"), "rate_limited")
+        self.assertEqual(c("segfault"), "other")
+
+    def test_auth_error_on_stdout_with_empty_stderr(self):
+        stdout = json.dumps({"is_error": True, "result": "Invalid API key · Please run /login"})
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=1)):
+            out = shim.run_claude("secret prompt text")
+        self.assertEqual((out["code"], out["error_code"]), (500, "auth_expired"))
+
+    def test_log_has_exit_and_truncated_redacted_stderr_but_no_prompt(self):
+        import contextlib
+        import io
+        err = "boom sk-ant-oat01-SECRETSECRET " + "x" * 600
+        buf = io.StringIO()
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc("", rc=2, stderr=err)), \
+                contextlib.redirect_stdout(buf):
+            out = shim.run_claude("my private prompt")
+        line = buf.getvalue()
+        self.assertEqual(out["error_code"], "other")
+        self.assertIn("exit=2", line)
+        self.assertNotIn("SECRETSECRET", line)
+        self.assertNotIn("my private prompt", line)
+        self.assertLess(len(line), 450)
+
+    def test_rate_limit_in_stream_path(self):
+        stdout = _stream({"type": "result", "is_error": True, "result": "usage limit reached"})
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=1)):
+            out = shim.run_claude("p", images=[{"media_type": "image/png", "data": PNG}])
+        self.assertEqual(out["error_code"], "rate_limited")
+
+
+class CheckEndpointTest(unittest.TestCase):
+    setUpClass = HTTPTest.__dict__['setUpClass']
+    tearDownClass = HTTPTest.__dict__['tearDownClass']
+    post = HTTPTest.post
+
+    def test_http_error_carries_code(self):
+        stdout = json.dumps({"is_error": True, "result": "Please run /login"})
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=1)):
+            code, body = self.post("/claude", {"prompt": "x"})
+        self.assertEqual((code, body["error_code"]), (500, "auth_expired"))
+
+    def test_check_reports_provider_status_and_last_error(self):
+        stdout = json.dumps({"is_error": True, "result": "Please run /login"})
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc(stdout, rc=1)):
+            code, body = self.post("/check", {})
+        p = body["providers"]["claude"]
+        self.assertEqual((code, body["ok"], p["status"]), (503, False, "auth_expired"))
+        self.assertEqual(p["lastError"]["code"], "auth_expired")
+        with mock.patch.object(shim.subprocess, "run", return_value=_proc(json.dumps({"result": "ok"}))):
+            code, body = self.post("/check", {})
+        self.assertEqual((code, body["providers"]["claude"]["status"]), (200, "ok"))
 
 
 class TokenTests(unittest.TestCase):

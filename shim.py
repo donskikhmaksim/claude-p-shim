@@ -153,6 +153,51 @@ def build_stream_input(prompt: str, images: list) -> str:
     return json.dumps(msg, ensure_ascii=False) + "\n"
 
 
+# ------------------------------------------------------------ failure reasons
+# Machine-readable failure codes returned to the client as "error_code".
+AUTH_EXPIRED, RATE_LIMITED, OTHER = "auth_expired", "rate_limited", "other"
+_AUTH_RE = re.compile(
+    r"invalid api key|/login|please run.*login|authentication[_ ]error|oauth token|"
+    r"token (has )?(expired|revoked)|expired token|invalid (bearer|token|x-api-key)|"
+    r"unauthori[sz]ed|\b401\b|not logged in|credentials",
+    re.I,
+)
+_RATE_RE = re.compile(
+    r"rate[ _-]?limit|usage limit|limit reached|too many requests|\b429\b|quota|"
+    r"credit balance|reached your .*limit",
+    re.I,
+)
+_SECRET_RE = re.compile(r"(sk-ant-[A-Za-z0-9_\-]+|Bearer\s+[A-Za-z0-9._\-]+)", re.I)
+# Last outcome of a claude call, reported by POST /check.
+_LAST = {"error": None, "ok_at": None}
+
+
+def classify_failure(text: str) -> str:
+    if _AUTH_RE.search(text or ""):
+        return AUTH_EXPIRED
+    if _RATE_RE.search(text or ""):
+        return RATE_LIMITED
+    return OTHER
+
+
+def _fail(exit_code, stderr: str, fallback: str = "") -> dict:
+    """Build a failed result, log the reason (exit code + first 300 chars of
+    stderr, tokens redacted, never the prompt) and remember it for /check.
+    `fallback` is the CLI's own error text (it often prints auth errors to
+    stdout, with empty stderr)."""
+    detail = _SECRET_RE.sub("[redacted]", ((stderr or "").strip() or (fallback or "").strip())[:300])
+    kind = classify_failure(f"{stderr or ''}\n{fallback or ''}")
+    print(f"claude_failed exit={exit_code} error_code={kind} detail={detail!r}", flush=True)
+    _LAST["error"] = {"code": kind, "exit": exit_code, "detail": detail, "at": int(time.time())}
+    return {"ok": False, "code": 500, "error": (stderr or fallback or "claude failed")[:800],
+            "error_code": kind}
+
+
+def _ok(out: dict) -> dict:
+    _LAST["ok_at"] = int(time.time())
+    return out
+
+
 def parse_stream_output(stdout: str) -> dict:
     """Pick the LAST `type == "result"` event out of stream-json stdout."""
     final = None
@@ -173,7 +218,7 @@ def parse_stream_output(stdout: str) -> dict:
         result = "" if result is None else json.dumps(result, ensure_ascii=False)
     if final.get("is_error"):
         err = result or final.get("subtype") or "claude error"
-        return {"ok": False, "code": 500, "error": err[:800]}
+        return {"ok": False, "code": 500, "error": err[:800], "is_error": True}
     return {"ok": True, "result": result, "usage": final.get("usage") or {}}
 
 
@@ -228,17 +273,22 @@ def _run_claude_text(prompt: str, system: str, model: str) -> dict:
     except FileNotFoundError:
         return {"ok": False, "code": 500, "error": f"claude binary not found: {CLAUDE}"}
     if proc.returncode != 0:
-        return {"ok": False, "code": 500, "error": (proc.stderr or "claude failed")[:800]}
+        fb = ""
+        try:  # the CLI prints its error as a JSON envelope on stdout
+            fb = str(json.loads(proc.stdout).get("result") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        return _fail(proc.returncode, proc.stderr, fb)
     usage: dict = {}
     try:
         env = json.loads(proc.stdout)
         result = env.get("result", "")
         usage = env.get("usage") or {}
         if env.get("is_error"):
-            return {"ok": False, "code": 500, "error": (result or "claude error")[:800]}
+            return _fail(proc.returncode, proc.stderr, result or "claude error")
     except Exception:  # noqa: BLE001 — fall back to raw stdout
         result = proc.stdout
-    return {"ok": True, "result": result, "usage": usage}
+    return _ok({"ok": True, "result": result, "usage": usage})
 
 
 def _run_claude_images(prompt: str, system: str, model: str, images: list) -> dict:
@@ -272,10 +322,12 @@ def _run_claude_images(prompt: str, system: str, model: str, images: list) -> di
     out = parse_stream_output(proc.stdout)
     if proc.returncode != 0 and out.get("ok"):
         # Non-zero exit but a "successful" result — don't trust it.
-        return {"ok": False, "code": 500, "error": (proc.stderr or "claude failed")[:800]}
+        return _fail(proc.returncode, proc.stderr)
     if proc.returncode != 0 and out.get("error") == "claude produced no result event":
-        return {"ok": False, "code": 500, "error": (proc.stderr or "claude failed")[:800]}
-    return out
+        return _fail(proc.returncode, proc.stderr)
+    if not out.get("ok") and out.get("code") == 500:
+        return _fail(proc.returncode, proc.stderr, out.get("error", ""))
+    return _ok(out) if out.get("ok") else out
 
 
 # ---------------------------------------------------------------- OpenAI shim
@@ -555,6 +607,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/chat/completions", "/chat/completions"):
             self.handle_chat_completions()
             return
+        if path == "/check":
+            self.handle_check()
+            return
         if path not in ("", "/claude"):
             self._send(404, {"ok": False, "error": "not found"})
             return
@@ -592,9 +647,29 @@ class Handler(BaseHTTPRequestHandler):
 
         out = run_claude(prompt, system, model, images)
         if not out["ok"]:
-            self._send(out["code"], {"ok": False, "error": out["error"]})
+            body = {"ok": False, "error": out["error"]}
+            if out.get("error_code"):
+                body["error_code"] = out["error_code"]
+            self._send(out["code"], body)
             return
         self._send(200, {"ok": True, "result": out["result"]})
+
+    def handle_check(self) -> None:
+        """Live probe of every provider (only `claude` exists): a 1-token call."""
+        if not token_ok(self.headers.get("Authorization", "")):
+            self._send(401, {"ok": False, "error": "unauthorized"})
+            return
+        out = run_claude("Reply with the single word: ok", "", "haiku")
+        status = "ok" if out["ok"] else out.get("error_code") or (
+            "busy" if out["code"] == 503 else "timeout" if out["code"] == 504 else OTHER)
+        self._send(200 if out["ok"] else 503, {
+            "ok": out["ok"],
+            "providers": {"claude": {
+                "status": status,
+                "lastError": _LAST["error"],
+                "lastOkAt": _LAST["ok_at"],
+            }},
+        })
 
     def handle_chat_completions(self) -> None:
         if not self._authed():
@@ -654,7 +729,9 @@ class Handler(BaseHTTPRequestHandler):
 
         out = run_claude(prompt or " ", system, pick_model(model_id), images)
         if not out["ok"]:
-            self._send(out["code"], {"error": {"message": out["error"], "type": "server_error"}})
+            self._send(out["code"], {"error": {
+                "message": out["error"], "type": "server_error",
+                "code": out.get("error_code", OTHER)}})
             return
         completion = build_completion(model_id, out["result"], tools, out.get("usage") or {})
         if data.get("stream"):
